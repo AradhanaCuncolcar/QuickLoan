@@ -1,8 +1,17 @@
+# .streamlit/config.toml — Navy & Emerald theme
 [theme]
-primaryColor = "#2563eb"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f1f5f9"
-textColor = "#1f2937"
+primaryColor = "#10B981"            # Emerald: buttons, sliders, active widgets
+backgroundColor = "#FFFFFF"         # Main canvas
+secondaryBackgroundColor = "#F8FAFC" # Cards, inputs, expanders
+textColor = "#0F172A"               # Navy-black body text
+font = "sans serif"
+
+# Optional navy sidebar (Streamlit >= 1.46). Delete this block for a light sidebar.
+[theme.sidebar]
+backgroundColor = "#0F172A"
+secondaryBackgroundColor = "#1E293B"
+textColor = "#F8FAFC"
+primaryColor = "#10B981"
 
 [server]
 headless = true
