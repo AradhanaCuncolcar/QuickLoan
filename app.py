@@ -649,6 +649,23 @@ def sidebar(df: pd.DataFrame | None) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 # 8 · PAGE 1 — SIMULATOR + XAI + HUMAN-IN-THE-LOOP
 # ──────────────────────────────────────────────────────────────────────────────
+def get_policy_decline_reasons(applicant: dict) -> list[str]:
+    """Hard business guardrails that override the ML model."""
+    reasons = []
+    
+    # 1. Absolute Debt-to-Income ceiling
+    if applicant["debt_to_income"] > 0.60:
+        reasons.append(f"Debt-to-Income ratio ({applicant['debt_to_income']}) exceeds maximum policy limit of 0.60.")
+    
+    # 2. Monthly cash flow sanity check
+    monthly_income = applicant["annual_income"] / 12
+    monthly_principal = applicant["loan_amount"] / applicant["loan_term_months"]
+    if monthly_principal > (monthly_income * 0.45):
+        reasons.append(f"Required monthly payment (AED {monthly_principal:,.0f}) exceeds 45% of monthly gross income.")
+        
+    return reasons
+
+
 def applicant_form() -> dict | None:
     """Input form. Nothing is scored until the user presses the submit button."""
     with st.form("applicant_form"):
@@ -683,6 +700,12 @@ def score_application(ctx: dict, applicant: dict) -> dict:
         st.write("Running the credit model…")
         pred = int(np.asarray(bundle["model"].predict(X))[0])
         prob = float(bundle["base"].predict_proba(X)[0, 1])
+        
+        # Apply business guardrails to Simulator scoring
+        policy_reasons = get_policy_decline_reasons(applicant)
+        if policy_reasons:
+            pred = 1
+
         exp = None
         if SHAP_OK:
             st.write("Computing SHAP feature contributions…")
@@ -691,7 +714,13 @@ def score_application(ctx: dict, applicant: dict) -> dict:
             except Exception as e:  # keep the decision even if the explanation fails
                 st.warning(f"Explanation could not be generated: {e}")
         status.update(label="Decision ready", state="complete", expanded=False)
-    reasons = principal_reasons(exp["table"]) if (exp and pred == 1) else []
+    
+    reasons = []
+    if policy_reasons:
+        reasons = [{"feature": "policy", "reason": "Business Policy Violation", "value": pr, "shap": 1.0} for pr in policy_reasons]
+    elif exp and pred == 1:
+        reasons = principal_reasons(exp["table"])
+
     return {"id": f"APP-{uuid.uuid4().hex[:8].upper()}", "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "applicant": applicant, "model": ctx["model_label"], "model_file": ctx["model_file"], "prob": prob,
             "cutoff": bundle["threshold"], "model_decision": "Denied" if pred == 1 else "Approved",
@@ -717,7 +746,11 @@ def commit_decision(cur: dict, underwriter: str, action: str, final: str, justif
 def render_decision(cur: dict) -> None:
     """Prediction banner + probability metrics."""
     p, cut = cur["prob"], cur["cutoff"]
-    if cur["model_decision"] == "Denied":
+    is_policy_denial = any(r.get("feature") == "policy" for r in cur["reasons"])
+
+    if is_policy_denial:
+        st.error(f"❌ **Model decision: DENIED (POLICY OVERRIDE)** — {cur['reasons'][0]['value']}")
+    elif cur["model_decision"] == "Denied":
         st.error(f"❌ **Model decision: DENIED** — predicted default risk {p:.1%} is at or above the {cut:.1%} cut-off.")
     else:
         st.success(f"✅ **Model decision: APPROVED** — predicted default risk {p:.1%} is below the {cut:.1%} cut-off.")
@@ -1402,7 +1435,10 @@ def page_whatif(ctx: dict) -> None:
     applicant = {k: st.session_state[f"wi_{k}"] for k in WI_DEFAULTS}
     applicant["debt_to_income"] = round(applicant["loan_amount"] / (applicant["annual_income"] + 1), 2)
     p = float(predict_prob(bundle, pd.DataFrame([applicant]))[0])
-    denied = p >= cutoff
+    
+    # Apply business guardrails
+    policy_reasons = get_policy_decline_reasons(applicant)
+    denied = (p >= cutoff) or bool(policy_reasons)
 
     # remember the previous score so the gauge can show how the last change moved the risk
     sig = tuple(applicant.items())
@@ -1414,9 +1450,12 @@ def page_whatif(ctx: dict) -> None:
 
     with right:
         st.plotly_chart(fig_gauge(p, cutoff, prev), width="stretch")
-        (st.error if denied else st.success)(
-            f"{'❌ DENIED' if denied else '✅ APPROVED'} — default risk {p:.1%} vs cut-off {cutoff:.1%}"
-            f" · debt-to-income {applicant['debt_to_income']:.2f}")
+        if policy_reasons:
+            st.error(f"❌ **DENIED (POLICY OVERRIDE)** — {policy_reasons[0]}")
+        else:
+            (st.error if denied else st.success)(
+                f"{'❌ DENIED' if denied else '✅ APPROVED'} — default risk {p:.1%} vs cut-off {cutoff:.1%}"
+                f" · debt-to-income {applicant['debt_to_income']:.2f}")
         if st.button("📨 Send to underwriter queue", help="Creates a formal application on the Simulator page for human review."):
             try:
                 st.session_state.current = score_application(ctx, applicant)
