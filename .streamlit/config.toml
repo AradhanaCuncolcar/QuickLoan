@@ -1,17 +1,17 @@
-# .streamlit/config.toml — Navy & Emerald theme
+# .streamlit/config.toml — colourful theme
 [theme]
-primaryColor = "#10B981"            # Emerald: buttons, sliders, active widgets
-backgroundColor = "#FFFFFF"         # Main canvas
-secondaryBackgroundColor = "#F8FAFC" # Cards, inputs, expanders
-textColor = "#0F172A"               # Navy-black body text
+primaryColor = "#10B981"            # Emerald: sliders, toggles, active widgets
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F8FAFC"
+textColor = "#0F172A"
 font = "sans serif"
 
-# Optional navy sidebar (Streamlit >= 1.46). Delete this block for a light sidebar.
+# Deep indigo/purple sidebar (the app's CSS adds the gradient on top)
 [theme.sidebar]
-backgroundColor = "#0F172A"
-secondaryBackgroundColor = "#1E293B"
+backgroundColor = "#1E1B4B"
+secondaryBackgroundColor = "#4C1D95"
 textColor = "#F8FAFC"
-primaryColor = "#10B981"
+primaryColor = "#F472B6"
 
 [server]
 headless = true
