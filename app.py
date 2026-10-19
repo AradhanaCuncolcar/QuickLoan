@@ -51,6 +51,12 @@ DEFAULT_RULE_LABEL = list(MODEL_FILES)[1]  # used as the comparison baseline for
 NAVY, EMERALD, SLATE, RED, AMBER = "#0F172A", "#10B981", "#64748B", "#EF4444", "#F59E0B"
 LIGHT = "#E2E8F0"
 INDIGO, SKY, VIOLET, ROSE, TEAL = "#6366F1", "#0EA5E9", "#8B5CF6", "#F43F5E", "#14B8A6"
+ORANGE, PINK, BLUE = "#F97316", "#EC4899", "#3B82F6"
+PALETTE = [VIOLET, EMERALD, ORANGE, SKY, PINK, AMBER, INDIGO, TEAL]  # categorical colours for charts
+# Hero / accent gradient per page: (colour 1, colour 2, colour 3)
+PAGE_THEMES = {0: ("#7C3AED", "#C026D3", "#EC4899"),   # simulator: violet → magenta → pink
+               1: ("#EA580C", "#F59E0B", "#EF4444"),   # fairness: orange → amber → red
+               2: ("#2563EB", "#0EA5E9", "#10B981")}   # cost: blue → sky → emerald
 
 # Must reproduce the split the notebook used, so "held-out" numbers match the leaderboard CSVs.
 SPLIT_KWARGS = dict(test_size=0.25, random_state=1)
@@ -364,7 +370,7 @@ def style_fig(fig: go.Figure, height: int = 420, title: str | None = None) -> go
         template="plotly_white", height=height, title=dict(text=title, x=0.0, font=dict(size=16, color=NAVY)) if title else None,
         font=dict(color=NAVY, size=13), margin=dict(l=10, r=20, t=60 if title else 20, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="#F8FAFC", transition=dict(duration=600, easing="cubic-in-out"),
+        plot_bgcolor="rgba(255,255,255,0.75)", colorway=PALETTE, transition=dict(duration=600, easing="cubic-in-out"),
         hoverlabel=dict(bgcolor="white", font_color=NAVY))
     fig.update_xaxes(gridcolor=LIGHT, zeroline=False)
     fig.update_yaxes(gridcolor=LIGHT, zeroline=False)
@@ -386,7 +392,7 @@ def fig_shap_waterfall(exp: dict, cutoff_prob: float) -> go.Figure:
         orientation="h", y=labels, x=values, text=texts, textposition="outside",
         measure=["absolute"] + ["relative"] * len(t) + ["total"],
         hovertext=hover, hoverinfo="text",
-        increasing=dict(marker=dict(color=RED)), decreasing=dict(marker=dict(color=EMERALD)),
+        increasing=dict(marker=dict(color=ROSE)), decreasing=dict(marker=dict(color=TEAL)),
         totals=dict(marker=dict(color=INDIGO)), connector=dict(line=dict(color=LIGHT, width=1))))
     cut = float(np.log(cutoff_prob / (1 - cutoff_prob)))  # decision cut-off expressed in log-odds
     fig.add_vline(x=cut, line=dict(color=AMBER, dash="dash", width=2),
@@ -400,10 +406,10 @@ def fig_group_bars(stats: pd.DataFrame, title: str) -> go.Figure:
     """Grouped horizontal bars: model approval rate vs the actual repayment rate in each group."""
     fig = go.Figure()
     fig.add_bar(y=stats["group"].astype(str), x=stats["approval_rate"], orientation="h", name="Model approval rate",
-                marker_color=EMERALD, text=[f"{v:.1%}" for v in stats["approval_rate"]], textposition="outside",
+                marker_color=VIOLET, text=[f"{v:.1%}" for v in stats["approval_rate"]], textposition="outside",
                 customdata=stats[["n"]], hovertemplate="%{y}<br>Approval rate %{x:.1%}<br>n = %{customdata[0]}<extra></extra>")
     fig.add_bar(y=stats["group"].astype(str), x=stats["repay_rate"], orientation="h", name="Actual repayment rate",
-                marker_color=INDIGO, text=[f"{v:.1%}" for v in stats["repay_rate"]], textposition="outside",
+                marker_color=ORANGE, text=[f"{v:.1%}" for v in stats["repay_rate"]], textposition="outside",
                 customdata=stats[["n"]], hovertemplate="%{y}<br>Actually repaid %{x:.1%}<br>n = %{customdata[0]}<extra></extra>")
     ref = stats["reference_rate"].iloc[0] if len(stats) else np.nan
     if pd.notna(ref):
@@ -418,12 +424,12 @@ def fig_group_bars(stats: pd.DataFrame, title: str) -> go.Figure:
 def fig_dir_bars(stats: pd.DataFrame) -> go.Figure:
     """Disparate-impact ratio per group with the 0.80 line; failing groups are red."""
     s = stats.copy()
-    colors = [RED if f else (EMERALD if e else LIGHT) for f, e in zip(s["flag"], s["eligible"])]
+    colors = [RED if f else (PALETTE[i % len(PALETTE)] if e else LIGHT) for i, (f, e) in enumerate(zip(s["flag"], s["eligible"]))]
     fig = go.Figure(go.Bar(
         y=s["group"].astype(str), x=s["dir"].fillna(0), orientation="h", marker_color=colors,
         text=[f"{v:.2f}" if pd.notna(v) else f"n<{MIN_GROUP_N}" for v in s["dir"]], textposition="outside",
         hovertemplate="%{y}<br>DIR %{x:.3f}<extra></extra>"))
-    fig.add_vline(x=FOUR_FIFTHS, line=dict(color=RED, dash="dash"), annotation_text="0.80 threshold")
+    fig.add_vline(x=FOUR_FIFTHS, line=dict(color=RED, dash="dash"), annotation_text="0.80 threshold", annotation_font_color=RED)
     fig.update_xaxes(range=[0, 1.15], title="Disparate impact ratio (group rate ÷ highest group rate)")
     fig.update_yaxes(autorange="reversed")
     return style_fig(fig, height=max(260, 70 * len(s) + 110), title="Disparate impact ratio")
@@ -433,7 +439,7 @@ def fig_money_curve(sweep: pd.DataFrame, sel: dict, breakeven: float) -> go.Figu
     """Money saved vs cut-off, with the selected threshold, the cost-matched break-even and the 0.5 rule."""
     fig = go.Figure()
     fig.add_scatter(x=sweep["threshold"], y=sweep["money"], mode="lines", name="Money saved",
-                    line=dict(color=EMERALD, width=3), fill="tozeroy", fillcolor="rgba(16,185,129,0.15)",
+                    line=dict(color=BLUE, width=3), fill="tozeroy", fillcolor="rgba(59,130,246,0.18)",
                     hovertemplate="Cut-off %{x:.2f}<br>AED %{y:,.0f}<extra></extra>")
     fig.add_scatter(x=[sel["threshold"]], y=[sel["money"]], mode="markers", name="Selected cut-off",
                     marker=dict(size=16, color=ROSE, line=dict(color="white", width=2)))
@@ -453,14 +459,14 @@ def fig_roc(sweep: pd.DataFrame, sel: dict, overlay: pd.DataFrame | None) -> go.
     fig = go.Figure()
     fig.add_scatter(x=[0, 1], y=[0, 1], mode="lines", name="Random guessing", line=dict(color=LIGHT, dash="dash"), hoverinfo="skip")
     fig.add_scatter(x=sweep["fpr"], y=sweep["tpr"], mode="lines", name="Gradient Boosting (all cut-offs)",
-                    line=dict(color=EMERALD, width=3), fill="tozeroy", fillcolor="rgba(16,185,129,0.12)",
+                    line=dict(color=PINK, width=3), fill="tozeroy", fillcolor="rgba(236,72,153,0.14)",
                     customdata=sweep[["threshold", "money"]],
                     hovertemplate="Cut-off %{customdata[0]:.2f}<br>Good rejected %{x:.1%}<br>Defaulters caught %{y:.1%}"
                                   "<br>AED %{customdata[1]:,.0f}<extra></extra>")
     if overlay is not None and len(overlay):
         fig.add_scatter(x=overlay["fpr"], y=overlay["tpr"], mode="markers", name="Leaderboard models @ 1/6 rule (CSV)",
                         marker=dict(size=np.clip(overlay["Money_saved"] / overlay["Money_saved"].max() * 26, 8, 26),
-                                    color=VIOLET, opacity=0.6, line=dict(color="white", width=1)),
+                                    color=ORANGE, opacity=0.7, line=dict(color="white", width=1)),
                         text=overlay["Model"], customdata=overlay["Money_saved"],
                         hovertemplate="%{text}<br>Good rejected %{x:.1%}<br>Defaulters caught %{y:.1%}"
                                       "<br>AED %{customdata:,.0f}<extra></extra>")
@@ -475,7 +481,7 @@ def fig_risk_reward(sweep: pd.DataFrame, sel: dict) -> go.Figure:
     """Residual risk (default rate among approved loans) vs reward (money saved)."""
     fig = go.Figure()
     fig.add_scatter(x=sweep["default_rate_approved"], y=sweep["money"], mode="lines+markers", name="Cut-off path",
-                    line=dict(color=INDIGO, width=3), marker=dict(size=5, color=VIOLET), customdata=sweep[["threshold"]],
+                    line=dict(color=TEAL, width=3), marker=dict(size=6, color=ORANGE), customdata=sweep[["threshold"]],
                     hovertemplate="Cut-off %{customdata[0]:.2f}<br>Default rate of approved %{x:.2%}<br>AED %{y:,.0f}<extra></extra>")
     fig.add_scatter(x=[sel["default_rate_approved"]], y=[sel["money"]], mode="markers", name="Selected cut-off",
                     marker=dict(size=17, color=ROSE, line=dict(color="white", width=2)))
@@ -490,7 +496,7 @@ def fig_cv_robustness(cv: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     fig.add_bar(y=cv["Model"], x=cv["CV money @0.5 (mean)"], orientation="h", name="0.5 rule", marker_color=SKY,
                 error_x=dict(type="data", array=cv["CV money @0.5 (std)"], color=INDIGO))
-    fig.add_bar(y=cv["Model"], x=cv["CV money @1/6 (mean)"], orientation="h", name="Cost-matched 1/6 rule", marker_color=EMERALD)
+    fig.add_bar(y=cv["Model"], x=cv["CV money @1/6 (mean)"], orientation="h", name="Cost-matched 1/6 rule", marker_color=PINK)
     fig.update_layout(barmode="group")
     fig.update_xaxes(title="Cross-validated money saved (AED)", tickformat=",.0f")
     return style_fig(fig, height=520, title="Robustness: 15-fold cross-validation")
@@ -499,35 +505,52 @@ def fig_cv_robustness(cv: pd.DataFrame) -> go.Figure:
 # ──────────────────────────────────────────────────────────────────────────────
 # 7 · UI HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
-def inject_css() -> None:
-    """Colour layer on top of config.toml: gradient hero, tinted KPI cards, gradient sidebar, coloured tabs/buttons."""
+def inject_css(page_idx: int = 0) -> None:
+    """Colourful layer on top of config.toml: pastel page background, per-page gradient hero, vivid KPI cards,
+    multicolour sidebar/tabs/buttons. Each page gets its own accent gradient (PAGE_THEMES)."""
+    c1, c2, c3 = PAGE_THEMES.get(page_idx, PAGE_THEMES[0])
     st.markdown(
         f"""<style>
-        h1, h2, h3 {{color:{NAVY};letter-spacing:-0.01em;}}
-        h2 {{border-bottom:3px solid {EMERALD};padding-bottom:.25rem;display:inline-block;}}
-        h3 {{color:{INDIGO};}}
+        .stApp {{background:linear-gradient(160deg,#FDF2F8 0%,#EEF2FF 30%,#ECFEFF 62%,#FFFBEB 100%);}}
+        [data-testid="stHeader"] {{background:transparent;}}
         .block-container {{padding-top:1.5rem;}}
-        .hero {{background:linear-gradient(120deg,{NAVY} 0%,#134E4A 55%,{EMERALD} 100%);color:white;
-               padding:1.6rem 2rem;border-radius:16px;margin-bottom:1rem;box-shadow:0 8px 24px rgba(16,185,129,.25);}}
-        .hero h1 {{color:white;margin:0;font-size:2rem;}}
-        .hero p {{color:#D1FAE5;margin:.3rem 0 0 0;font-size:1rem;}}
-        [data-testid="stMetric"] {{border:1px solid {LIGHT};border-left:6px solid {EMERALD};border-radius:14px;
-               padding:12px 16px;background:linear-gradient(135deg,#ECFDF5 0%,#FFFFFF 70%);box-shadow:0 2px 8px rgba(15,23,42,.06);}}
-        [data-testid="stHorizontalBlock"] > div:nth-child(2) [data-testid="stMetric"] {{border-left-color:{INDIGO};background:linear-gradient(135deg,#EEF2FF 0%,#FFFFFF 70%);}}
-        [data-testid="stHorizontalBlock"] > div:nth-child(3) [data-testid="stMetric"] {{border-left-color:{AMBER};background:linear-gradient(135deg,#FFFBEB 0%,#FFFFFF 70%);}}
-        [data-testid="stHorizontalBlock"] > div:nth-child(4) [data-testid="stMetric"] {{border-left-color:{SKY};background:linear-gradient(135deg,#F0F9FF 0%,#FFFFFF 70%);}}
-        [data-testid="stHorizontalBlock"] > div:nth-child(5) [data-testid="stMetric"] {{border-left-color:{ROSE};background:linear-gradient(135deg,#FFF1F2 0%,#FFFFFF 70%);}}
-        [data-testid="stSidebar"] > div:first-child {{background:linear-gradient(180deg,{NAVY} 0%,#0B3B35 100%);}}
+        h1, h2, h3 {{letter-spacing:-0.01em;}}
+        h2 {{color:{c1};border-bottom:4px solid {c2};padding-bottom:.2rem;display:inline-block;}}
+        h3 {{color:{c2};}}
+        .hero {{background:linear-gradient(120deg,{c1} 0%,{c2} 55%,{c3} 100%);color:white;padding:1.6rem 2rem;
+               border-radius:20px;margin-bottom:1rem;box-shadow:0 10px 28px rgba(0,0,0,.18);}}
+        .hero h1 {{color:white;margin:0;font-size:2.1rem;}}
+        .hero p {{color:rgba(255,255,255,.92);margin:.3rem 0 0 0;font-size:1.02rem;}}
+        /* KPI cards: solid vivid gradients, one per column, white text, delta in a white pill */
+        [data-testid="stMetric"] {{border-radius:18px;padding:14px 18px;box-shadow:0 6px 16px rgba(0,0,0,.15);
+               background:linear-gradient(135deg,#10B981,#14B8A6);}}
+        [data-testid="stHorizontalBlock"] > div:nth-child(2) [data-testid="stMetric"] {{background:linear-gradient(135deg,#6366F1,#8B5CF6);}}
+        [data-testid="stHorizontalBlock"] > div:nth-child(3) [data-testid="stMetric"] {{background:linear-gradient(135deg,#F97316,#F59E0B);}}
+        [data-testid="stHorizontalBlock"] > div:nth-child(4) [data-testid="stMetric"] {{background:linear-gradient(135deg,#0EA5E9,#3B82F6);}}
+        [data-testid="stHorizontalBlock"] > div:nth-child(5) [data-testid="stMetric"] {{background:linear-gradient(135deg,#EC4899,#F43F5E);}}
+        [data-testid="stMetricLabel"], [data-testid="stMetricLabel"] *, [data-testid="stMetricValue"], [data-testid="stMetricValue"] * {{color:white !important;}}
+        [data-testid="stMetricDelta"] {{background:rgba(255,255,255,.94);border-radius:999px;padding:1px 10px;width:fit-content;}}
+        /* sidebar */
+        [data-testid="stSidebar"] > div:first-child {{background:linear-gradient(180deg,#1E1B4B 0%,#4C1D95 55%,#9D174D 100%);}}
+        /* buttons */
         .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {{
-               background:linear-gradient(90deg,{EMERALD},{TEAL});border:none;color:white;font-weight:600;
-               box-shadow:0 4px 12px rgba(16,185,129,.35);}}
-        .stButton > button:not([kind="primary"]) {{border:1.5px solid {INDIGO};color:{INDIGO};}}
-        .stTabs [data-baseweb="tab-list"] {{gap:6px;}}
-        .stTabs [data-baseweb="tab"] {{background:#ECFDF5;border-radius:10px 10px 0 0;padding:8px 18px;}}
-        .stTabs [aria-selected="true"] {{background:{EMERALD};}}
-        .stTabs [aria-selected="true"] p {{color:white;font-weight:600;}}
-        [data-testid="stExpander"] {{border:1px solid {LIGHT};border-left:5px solid {VIOLET};border-radius:12px;}}
-        [data-testid="stForm"] {{background:linear-gradient(135deg,#F0FDF4 0%,#F8FAFC 100%);border:1px solid #A7F3D0;border-radius:16px;}}
+               background:linear-gradient(90deg,{c1},{c3});border:none;color:white;font-weight:700;box-shadow:0 6px 14px rgba(0,0,0,.2);}}
+        .stButton > button:not([kind="primary"]) {{border:2px solid {c1};color:{c1};background:white;font-weight:600;}}
+        /* tabs: every tab its own colour */
+        .stTabs [data-baseweb="tab-list"] {{gap:8px;}}
+        .stTabs [data-baseweb="tab"] {{border-radius:12px 12px 0 0;padding:8px 20px;}}
+        .stTabs [data-baseweb="tab"]:nth-child(1) {{background:#EDE9FE;}}
+        .stTabs [data-baseweb="tab"]:nth-child(2) {{background:#FFEDD5;}}
+        .stTabs [data-baseweb="tab"]:nth-child(3) {{background:#CFFAFE;}}
+        .stTabs [data-baseweb="tab"]:nth-child(4) {{background:#FCE7F3;}}
+        .stTabs [data-baseweb="tab"]:nth-child(1)[aria-selected="true"] {{background:linear-gradient(90deg,#7C3AED,#C026D3);}}
+        .stTabs [data-baseweb="tab"]:nth-child(2)[aria-selected="true"] {{background:linear-gradient(90deg,#EA580C,#F59E0B);}}
+        .stTabs [data-baseweb="tab"]:nth-child(3)[aria-selected="true"] {{background:linear-gradient(90deg,#0891B2,#10B981);}}
+        .stTabs [data-baseweb="tab"]:nth-child(4)[aria-selected="true"] {{background:linear-gradient(90deg,#DB2777,#F43F5E);}}
+        .stTabs [aria-selected="true"] p {{color:white;font-weight:700;}}
+        /* expanders and form */
+        [data-testid="stExpander"] {{background:rgba(255,255,255,.85);border:1px solid #E9D5FF;border-left:6px solid {c2};border-radius:14px;}}
+        [data-testid="stForm"] {{background:linear-gradient(135deg,#F5F3FF 0%,#FDF2F8 50%,#FFF7ED 100%);border:2px solid {c2};border-radius:18px;}}
         </style>""", unsafe_allow_html=True)
 
 
@@ -996,11 +1019,11 @@ def page_cost(ctx: dict, fdf: pd.DataFrame, df_all: pd.DataFrame) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     st.set_page_config(page_title="QuickLoan Risk & Compliance Console", page_icon="💰", layout="wide")
-    inject_css()
     ensure_state()
 
     raw, data_err = read_csv_safe("loans.csv", tuple(FEATURES) + ("default",))
     ctx = sidebar(raw)
+    inject_css(NAV_PAGES.index(ctx["page"]))
 
     # Load the active model (hard requirement for every page).
     try:
