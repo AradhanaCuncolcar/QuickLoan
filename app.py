@@ -1015,4 +1015,750 @@ def page_cost(ctx: dict, fdf: pd.DataFrame, df_all: pd.DataFrame) -> None:
                     "Rule": ["Cost-matched 1/6", "Default 0.5"],
                     "Live money saved (AED)": [at16["money"], ref["money"]],
                     "CSV money saved (AED)": [float(gb["Money_saved"].iloc[0]), float(gb["Money_at_0_5"].iloc[0])
-                                              if "Money_at_0_
+                                              if "Money_at_0_5" in gb.columns else np.nan]})
+                rec["Difference"] = rec["Live money saved (AED)"] - rec["CSV money saved (AED)"]
+                st.dataframe(rec.style.format({c: "{:,.0f}" for c in rec.columns[1:]}), hide_index=True, width="stretch")
+    with st.expander("🏁 Leaderboard at the cost-matched 1/6 rule (CSV)"):
+        if lb_err:
+            st.error(lb_err)
+        else:
+            st.dataframe(lb, hide_index=True, width="stretch")
+    with st.expander("🧪 Cross-validation robustness (CSV)"):
+        if cv_err:
+            st.error(cv_err)
+        else:
+            st.plotly_chart(fig_cv_robustness(cv), width="stretch")
+            st.caption("Error bars show fold-to-fold standard deviation at the 0.5 rule (the table has no std for the 1/6 rule).")
+            st.dataframe(cv, hide_index=True, width="stretch")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 10b · SCENARIO ENGINE (what-if, sensitivity, risk map, path to approval)
+# ──────────────────────────────────────────────────────────────────────────────
+FEATURE_RANGES = {"age": (21, 64), "annual_income": (24000, 400000), "loan_amount": (5000, 150000),
+                  "loan_term_months": (12, 60), "employment_years": (0.0, 35.0),
+                  "credit_history_months": (0, 300), "num_existing_loans": (0, 8), "past_defaults": (0, 6)}
+DISCRETE_GRIDS = {"loan_term_months": [12, 24, 36, 48, 60], "num_existing_loans": list(range(0, 9)),
+                  "past_defaults": list(range(0, 7)), "age": list(range(21, 65))}
+SCENARIO_FEATURES = list(FEATURE_RANGES)  # numeric inputs the what-if tools can vary
+PRESETS = {
+    "Prime saver": dict(age=45, annual_income=180000, loan_amount=30000, loan_term_months=36, employment_years=12.0,
+                        credit_history_months=200, num_existing_loans=0, past_defaults=0, home_ownership="own"),
+    "Borderline case": dict(age=35, annual_income=90000, loan_amount=100000, loan_term_months=36, employment_years=4.0,
+                            credit_history_months=60, num_existing_loans=3, past_defaults=0, home_ownership="rent"),
+    "High-risk profile": dict(age=28, annual_income=40000, loan_amount=80000, loan_term_months=60, employment_years=1.0,
+                              credit_history_months=24, num_existing_loans=4, past_defaults=2, home_ownership="rent"),
+}
+
+
+def feature_grid(feature: str, n: int = 60) -> list:
+    """Values to sweep for one feature: the natural discrete set, or an evenly spaced range."""
+    if feature in DISCRETE_GRIDS:
+        return DISCRETE_GRIDS[feature]
+    lo, hi = FEATURE_RANGES[feature]
+    vals = np.linspace(lo, hi, n)
+    return [round(float(v), 1) for v in vals] if feature == "employment_years" else [int(round(v, -2)) for v in vals]
+
+
+def scenarios_frame(applicant: dict, overrides: list) -> pd.DataFrame:
+    """One row per scenario = the applicant with some fields overridden (debt-to-income kept consistent)."""
+    rows = []
+    for ov in overrides:
+        a = {**applicant, **ov}
+        a["debt_to_income"] = round(a["loan_amount"] / (a["annual_income"] + 1), 2)
+        rows.append(a)
+    return pd.DataFrame(rows)
+
+
+def predict_prob(bundle: dict, df: pd.DataFrame) -> np.ndarray:
+    """P(default) for each row of raw applicant data."""
+    return bundle["base"].predict_proba(encode(df, bundle["columns"]))[:, 1]
+
+
+def sensitivity_curve(bundle: dict, applicant: dict, feature: str) -> pd.DataFrame:
+    """P(default) as ONE feature moves across its range while everything else is held fixed."""
+    vals = feature_grid(feature)
+    p = predict_prob(bundle, scenarios_frame(applicant, [{feature: v} for v in vals]))
+    return pd.DataFrame({"value": vals, "p": p})
+
+
+def risk_surface(bundle: dict, applicant: dict, fx: str, fy: str, n: int = 25) -> tuple:
+    """Grid of P(default) over two features -> (xs, ys, Z) with Z[row=y, col=x]."""
+    xs, ys = feature_grid(fx, n), feature_grid(fy, n)
+    p = predict_prob(bundle, scenarios_frame(applicant, [{fx: x, fy: y} for y in ys for x in xs]))
+    return xs, ys, p.reshape(len(ys), len(xs))
+
+
+def find_recourse(bundle: dict, applicant: dict, cutoff: float) -> tuple:
+    """'Path to approval': for a DENIED applicant, the smallest change to each actionable input that flips the
+    model to approve. Only inputs an applicant can realistically change are used (loan amount, existing loans,
+    loan term); history, past defaults and age are deliberately excluded. Returns (current_p, [options])."""
+    cur_p = float(predict_prob(bundle, pd.DataFrame([applicant]))[0])
+    if cur_p < cutoff:
+        return cur_p, []
+    options = []
+
+    def first_flip(overrides, describe):
+        p = predict_prob(bundle, scenarios_frame(applicant, overrides))
+        hit = np.flatnonzero(p < cutoff)
+        if len(hit):  # overrides are ordered from smallest to largest change
+            options.append({**describe(overrides[hit[0]]), "p_after": float(p[hit[0]])})
+
+    amt = int(applicant["loan_amount"])
+    first_flip([{"loan_amount": v} for v in range(amt - 1000, 4999, -1000)],
+              lambda o: {"action": "Request a smaller loan",
+                         "detail": f"AED {amt:,.0f} → AED {o['loan_amount']:,.0f}"})
+    n_loans = int(applicant["num_existing_loans"])
+    if n_loans > 0:
+        first_flip([{"num_existing_loans": v} for v in range(n_loans - 1, -1, -1)],
+                  lambda o: {"action": "Pay off existing loans",
+                             "detail": f"{n_loans} → {o['num_existing_loans']} existing loans"})
+    term = int(applicant["loan_term_months"])
+    first_flip([{"loan_term_months": t} for t in sorted(DISCRETE_GRIDS["loan_term_months"], key=lambda t: abs(t - term)) if t != term],
+              lambda o: {"action": "Change the repayment term", "detail": f"{term} → {o['loan_term_months']} months"})
+    if n_loans > 0 and not any(o["action"] == "Pay off existing loans" for o in options):
+        # combination: clear ALL existing loans AND shrink the request (only if paying some off was not enough)
+        first_flip([{"num_existing_loans": 0, "loan_amount": v} for v in range(amt, 4999, -1000)],
+                  lambda o: {"action": "Clear existing loans and adjust the amount",
+                             "detail": f"0 existing loans, loan AED {amt:,.0f} → AED {o['loan_amount']:,.0f}"})
+    return cur_p, options
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 10c · LIVE STREAM MATHS, BATCH SCORING, EXPLORER MATHS
+# ──────────────────────────────────────────────────────────────────────────────
+def stream_series(frame: pd.DataFrame, interest: float, window: int = 50) -> pd.DataFrame:
+    """Running totals for the live monitor: cumulative money saved and cumulative / rolling approval rate."""
+    y, r, loan = frame["default"].to_numpy(), frame["reject"].to_numpy(), frame["loan_amount"].to_numpy(float)
+    contrib = np.where((r == 1) & (y == 1), loan, 0.0) - interest * np.where((r == 1) & (y == 0), loan, 0.0)
+    appr = (r == 0).astype(float)
+    n = np.arange(1, len(frame) + 1)
+    return pd.DataFrame({"n": n, "money": contrib.cumsum(), "approval_cum": appr.cumsum() / n,
+                         "approval_roll": pd.Series(appr).rolling(window, min_periods=min(window, 10)).mean().to_numpy()})
+
+
+BATCH_REQUIRED = [f for f in FEATURES if f != "debt_to_income"]
+HOME_VALUES = ["rent", "own", "mortgage"]
+
+
+def validate_batch(raw: pd.DataFrame) -> tuple:
+    """Clean an uploaded applicant table. Returns (clean DataFrame | None, errors, warnings)."""
+    errors, warns = [], []
+    df = raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    missing = [c for c in BATCH_REQUIRED if c not in df.columns]
+    if missing:
+        return None, [f"Missing required column(s): {', '.join(missing)}"], warns
+    df = df.drop(columns=[c for c in ("default",) if c in df.columns])
+    for c in BATCH_REQUIRED:
+        if c != "home_ownership":
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["home_ownership"] = df["home_ownership"].astype(str).str.strip().str.lower()
+    bad = df[BATCH_REQUIRED].isna().any(axis=1) | ~df["home_ownership"].isin(HOME_VALUES)
+    if bad.any():
+        warns.append(f"{int(bad.sum())} row(s) with blank/invalid values were dropped "
+                     f"(home_ownership must be one of {', '.join(HOME_VALUES)}).")
+        df = df[~bad]
+    if df.empty:
+        return None, ["No valid rows left after cleaning."], warns
+    if "debt_to_income" not in df.columns:
+        df["debt_to_income"] = (df["loan_amount"] / (df["annual_income"] + 1)).round(2)
+    out_of_range = sum(int(((df[c] < lo) | (df[c] > hi)).sum()) for c, (lo, hi) in FEATURE_RANGES.items())
+    if out_of_range:
+        warns.append(f"{out_of_range} value(s) fall outside the ranges the model was trained on; treat those scores with caution.")
+    return df.reset_index(drop=True), errors, warns
+
+
+def score_batch(model_file: str, df: pd.DataFrame, progress=None, chunk: int = 1000) -> pd.DataFrame:
+    """Score many applicants. Adds p_default, decision and (for denials, when SHAP is available) top_driver."""
+    bundle = load_model_bundle(model_file)
+    cutoff = bundle["threshold"]
+    cols = bundle["columns"]
+    groups = {f: [i for i, c in enumerate(cols) if (c == f or (f == "home_ownership" and c.startswith("home_ownership_")))]
+              for f in FEATURES}
+    explainer = get_explainer(model_file) if SHAP_OK else None
+    probs, drivers = [], []
+    for start in range(0, len(df), chunk):
+        part = df.iloc[start:start + chunk]
+        X = encode(part[FEATURES], cols)
+        p = bundle["base"].predict_proba(X)[:, 1]
+        probs.append(p)
+        if explainer is not None:
+            sv = explainer.shap_values(X)
+            sv = np.asarray(sv[-1] if isinstance(sv, list) else sv)
+            if sv.ndim == 3:
+                sv = sv[:, :, -1]
+            per_feat = np.column_stack([sv[:, groups[f]].sum(axis=1) for f in FEATURES])
+            top = per_feat.argmax(axis=1)
+            drivers += [FEATURE_LABELS[FEATURES[t]] if (pp >= cutoff and per_feat[i, t] > 0) else "—"
+                        for i, (t, pp) in enumerate(zip(top, p))]
+        if progress:
+            progress(min(1.0, (start + chunk) / len(df)))
+    out = df.copy()
+    out["p_default"] = np.concatenate(probs)
+    out["decision"] = np.where(out["p_default"] >= cutoff, "Denied", "Approved")
+    if drivers:
+        out["top_driver"] = drivers
+    return out
+
+
+def bin_series(s: pd.Series, bins: int = 6) -> pd.Series:
+    """Ordered categorical bins for a feature: natural values if it has few, else quantile bins."""
+    if s.nunique() <= 8:
+        cats = [str(v) for v in sorted(s.unique())]
+        return pd.Series(pd.Categorical(s.astype(str), categories=cats, ordered=True), index=s.index)
+    q = pd.qcut(s, q=bins, duplicates="drop")
+    labels = {iv: f"{iv.left:,.0f}–{iv.right:,.0f}" if s.max() > 20 else f"{iv.left:.1f}–{iv.right:.1f}" for iv in q.cat.categories}
+    return q.map(labels).astype(pd.CategoricalDtype([labels[c] for c in q.cat.categories], ordered=True))
+
+
+def segment_grid(frame: pd.DataFrame, xcol: str, ycol: str, metric: str, bins: int = 6) -> pd.DataFrame:
+    """Pivot of a metric over two binned features (heat-map data)."""
+    f = frame.assign(_approval=(frame["reject"] == 0).astype(float))
+    col = {"Approval rate": "_approval", "Actual default rate": "default", "Avg predicted risk": "p_default"}[metric]
+    g = pd.DataFrame({"x": bin_series(f[xcol], bins), "y": bin_series(f[ycol], bins), "v": f[col]})
+    return g.groupby(["y", "x"], observed=False)["v"].mean().unstack("x")
+
+
+@st.cache_data(show_spinner=False)
+def global_importance(model_file: str, n: int = 600) -> pd.DataFrame:
+    """Global importance per feature: mean |SHAP| over a sample if SHAP works, else the model's own importances."""
+    bundle = load_model_bundle(model_file)
+    df, err = read_csv_safe("loans.csv", tuple(FEATURES) + ("default",))
+    if err:
+        raise FileNotFoundError(err)
+    X = encode(df.sample(min(n, len(df)), random_state=0).drop(columns="default"), bundle["columns"])
+    method = "mean |SHAP| (log-odds)"
+    try:
+        if not SHAP_OK:
+            raise RuntimeError("shap unavailable")
+        sv = get_explainer(model_file).shap_values(X)
+        sv = np.asarray(sv[-1] if isinstance(sv, list) else sv)
+        if sv.ndim == 3:
+            sv = sv[:, :, -1]
+        imp = np.abs(sv).mean(axis=0)
+    except Exception:
+        imp, method = np.asarray(bundle["base"].feature_importances_), "model feature importance (SHAP unavailable)"
+    merged = {}
+    for c, v in zip(bundle["columns"], imp):
+        k = "home_ownership" if c.startswith("home_ownership_") else c
+        merged[k] = merged.get(k, 0.0) + float(v)
+    out = pd.DataFrame({"feature": list(merged), "importance": list(merged.values())})
+    out["label"] = out["feature"].map(FEATURE_LABELS)
+    out["method"] = method
+    return out.sort_values("importance", ascending=False).reset_index(drop=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 10d · EXTRA CHARTS
+# ──────────────────────────────────────────────────────────────────────────────
+def fig_gauge(p: float, cutoff: float, delta_ref: float | None = None) -> go.Figure:
+    """Speedometer for default probability; the needle's colour flips when it crosses the cut-off."""
+    top = float(max(0.5, min(1.0, cutoff * 3)))
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number+delta", value=p * 100,
+        number=dict(suffix="%", valueformat=".1f"),
+        delta=dict(reference=(delta_ref if delta_ref is not None else p) * 100, valueformat=".1f", suffix=" pts",
+                   increasing=dict(color=RED), decreasing=dict(color=EMERALD)),
+        gauge=dict(axis=dict(range=[0, top * 100], ticksuffix="%"), bar=dict(color=ROSE if p >= cutoff else TEAL, thickness=0.35),
+                   steps=[dict(range=[0, cutoff * 100], color="#CCFBF1"), dict(range=[cutoff * 100, top * 100], color="#FFE4E6")],
+                   threshold=dict(line=dict(color=NAVY, width=4), thickness=0.85, value=cutoff * 100))))
+    fig.update_layout(height=290, margin=dict(l=20, r=20, t=30, b=10), paper_bgcolor="rgba(0,0,0,0)",
+                      transition=dict(duration=500, easing="cubic-in-out"), font=dict(color=NAVY))
+    return fig
+
+
+def fig_sensitivity(curve: pd.DataFrame, cur_x, cur_p: float, cutoff: float, label: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_scatter(x=curve["value"], y=curve["p"], mode="lines+markers", name="P(default)",
+                    line=dict(color=VIOLET, width=3), marker=dict(size=5, color=PINK),
+                    hovertemplate=label + " %{x:,.1f}<br>Default risk %{y:.1%}<extra></extra>")
+    fig.add_scatter(x=[cur_x], y=[cur_p], mode="markers", name="This applicant",
+                    marker=dict(size=16, color=AMBER, line=dict(color="white", width=2)))
+    fig.add_hrect(y0=cutoff, y1=max(float(curve["p"].max()), cutoff) * 1.05 + 1e-9, fillcolor="rgba(244,63,94,0.10)", line_width=0)
+    fig.add_hline(y=cutoff, line=dict(color=NAVY, dash="dash"), annotation_text=f"reject above {cutoff:.1%}")
+    fig.update_xaxes(title=label)
+    fig.update_yaxes(title="Default probability", tickformat=".0%")
+    return style_fig(fig, height=380, title=f"Sensitivity: how {label.lower()} moves the risk")
+
+
+def fig_risk_surface(xs, ys, Z, cutoff: float, lx: str, ly: str, cx, cy) -> go.Figure:
+    """Heat-map of default probability over two features; the black contour is the approve/deny boundary."""
+    fig = go.Figure()
+    fig.add_heatmap(x=xs, y=ys, z=Z, colorscale=[[0, "#10B981"], [0.35, "#FDE68A"], [0.7, "#F97316"], [1, "#BE123C"]],
+                    colorbar=dict(title="P(default)", tickformat=".0%"), hovertemplate=lx + " %{x}<br>" + ly + " %{y}<br>Risk %{z:.1%}<extra></extra>")
+    fig.add_contour(x=xs, y=ys, z=Z, showscale=False, hoverinfo="skip",
+                    contours=dict(type="levels", start=cutoff, end=cutoff, size=1, coloring="none"),
+                    line=dict(color=NAVY, width=3))
+    fig.add_scatter(x=[cx], y=[cy], mode="markers", name="This applicant",
+                    marker=dict(size=16, color="white", line=dict(color=NAVY, width=3), symbol="diamond"))
+    fig.update_xaxes(title=lx)
+    fig.update_yaxes(title=ly)
+    return style_fig(fig, height=450, title="Risk map: green = approve zone, dark line = decision boundary")
+
+
+def fig_stream_money(ser: pd.DataFrame) -> go.Figure:
+    fig = go.Figure(go.Scatter(x=ser["n"], y=ser["money"], mode="lines", line=dict(color=TEAL, width=3),
+                               fill="tozeroy", fillcolor="rgba(20,184,166,0.18)", name="Money saved",
+                               hovertemplate="Loan #%{x}<br>AED %{y:,.0f}<extra></extra>"))
+    fig.update_xaxes(title="Applications processed")
+    fig.update_yaxes(title="AED", tickformat=",.0f")
+    return style_fig(fig, height=330, title="Running money saved vs approve-all")
+
+
+def fig_stream_approval(ser: pd.DataFrame, baseline: float) -> go.Figure:
+    fig = go.Figure()
+    fig.add_scatter(x=ser["n"], y=ser["approval_roll"], mode="lines", name="Rolling approval rate (last 50)",
+                    line=dict(color=PINK, width=3))
+    fig.add_scatter(x=ser["n"], y=ser["approval_cum"], mode="lines", name="Cumulative approval rate",
+                    line=dict(color=BLUE, width=2, dash="dot"))
+    fig.add_hline(y=baseline, line=dict(color=NAVY, dash="dash"), annotation_text="portfolio baseline")
+    fig.add_hrect(y0=baseline - 0.10, y1=baseline + 0.10, fillcolor="rgba(16,185,129,0.10)", line_width=0)
+    fig.update_xaxes(title="Applications processed")
+    fig.update_yaxes(tickformat=".0%", range=[0, 1.02])
+    return style_fig(fig, height=330, title="Approval rate vs expected band (±10 pts)")
+
+
+def fig_risk_hist(frame: pd.DataFrame, cutoff: float) -> go.Figure:
+    fig = go.Figure()
+    for name, mask, colour in (("Approved", frame["reject"] == 0, TEAL), ("Denied", frame["reject"] == 1, ROSE)):
+        fig.add_histogram(x=frame.loc[mask, "p_default"], name=name, marker_color=colour, opacity=0.85,
+                          xbins=dict(start=0, end=1, size=0.025))
+    fig.add_vline(x=cutoff, line=dict(color=NAVY, dash="dash"), annotation_text="cut-off")
+    fig.update_layout(barmode="stack")
+    fig.update_xaxes(title="Predicted default probability", tickformat=".0%", range=[0, 1])
+    fig.update_yaxes(title="Applications")
+    return style_fig(fig, height=330, title="Risk score distribution of the live stream")
+
+
+def fig_decision_donut(df: pd.DataFrame) -> go.Figure:
+    counts = df["decision"].value_counts()
+    fig = go.Figure(go.Pie(labels=counts.index, values=counts.values, hole=0.6, sort=False,
+                           marker=dict(colors=[TEAL if k == "Approved" else ROSE for k in counts.index]),
+                           textinfo="label+percent"))
+    fig.update_layout(showlegend=False)
+    return style_fig(fig, height=330, title="Decision mix")
+
+
+def fig_importance(imp: pd.DataFrame) -> go.Figure:
+    s = imp.sort_values("importance")
+    fig = go.Figure(go.Bar(y=s["label"], x=s["importance"], orientation="h",
+                           marker_color=[PALETTE[i % len(PALETTE)] for i in range(len(s))],
+                           text=[f"{v:.3f}" for v in s["importance"]], textposition="outside"))
+    fig.update_xaxes(title=imp["method"].iloc[0])
+    return style_fig(fig, height=430, title="What drives the model overall?")
+
+
+def fig_segment_heatmap(grid: pd.DataFrame, xlab: str, ylab: str, metric: str) -> go.Figure:
+    scale = [[0, "#BE123C"], [0.5, "#FDE68A"], [1, "#10B981"]] if metric == "Approval rate" else \
+            [[0, "#10B981"], [0.5, "#FDE68A"], [1, "#BE123C"]]
+    fig = go.Figure(go.Heatmap(x=[str(c) for c in grid.columns], y=[str(i) for i in grid.index], z=grid.values,
+                               colorscale=scale, texttemplate="%{z:.0%}", colorbar=dict(tickformat=".0%"),
+                               hovertemplate=xlab + " %{x}<br>" + ylab + " %{y}<br>" + metric + " %{z:.1%}<extra></extra>"))
+    fig.update_xaxes(title=xlab)
+    fig.update_yaxes(title=ylab)
+    return style_fig(fig, height=450, title=f"{metric} by {xlab.lower()} × {ylab.lower()}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 10e · NEW PAGES
+# ──────────────────────────────────────────────────────────────────────────────
+# ---- Live What-If Studio ------------------------------------------------------
+WI_DEFAULTS = PRESETS["Borderline case"]
+
+
+def apply_preset() -> None:
+    """on_change callback: copy a preset into the live widgets' session_state keys."""
+    p = PRESETS.get(st.session_state.get("wi_preset"))
+    if p:
+        for k, v in p.items():
+            st.session_state[f"wi_{k}"] = v
+
+
+def page_whatif(ctx: dict) -> None:
+    st.header("Live What-If Studio")
+    st.caption("No submit button: move any control and the decision, explanation and charts update instantly.")
+    for k, v in WI_DEFAULTS.items():
+        st.session_state.setdefault(f"wi_{k}", v)
+    bundle = load_model_bundle(ctx["model_file"])
+    cutoff = bundle["threshold"]
+
+    left, right = st.columns([1, 1.15], gap="large")
+    with left:
+        st.selectbox("⚡ Quick presets", ["— choose —"] + list(PRESETS), key="wi_preset", on_change=apply_preset)
+        a1, a2 = st.columns(2)
+        a1.slider("Age", 21, 64, key="wi_age")
+        a2.slider("Employment years", 0.0, 35.0, step=0.5, key="wi_employment_years")
+        st.slider("Annual income (AED)", 24000, 400000, step=2000, key="wi_annual_income")
+        st.slider("Loan amount (AED)", 5000, 150000, step=1000, key="wi_loan_amount")
+        b1, b2 = st.columns(2)
+        b1.select_slider("Loan term (months)", options=DISCRETE_GRIDS["loan_term_months"], key="wi_loan_term_months")
+        b2.selectbox("Home ownership", HOME_VALUES, key="wi_home_ownership")
+        st.slider("Credit history (months)", 0, 300, key="wi_credit_history_months")
+        c1, c2 = st.columns(2)
+        c1.slider("Existing loans", 0, 8, key="wi_num_existing_loans")
+        c2.slider("Past defaults", 0, 6, key="wi_past_defaults")
+
+    applicant = {k: st.session_state[f"wi_{k}"] for k in WI_DEFAULTS}
+    applicant["debt_to_income"] = round(applicant["loan_amount"] / (applicant["annual_income"] + 1), 2)
+    p = float(predict_prob(bundle, pd.DataFrame([applicant]))[0])
+    denied = p >= cutoff
+
+    # remember the previous score so the gauge can show how the last change moved the risk
+    sig = tuple(applicant.items())
+    if st.session_state.get("wi_sig") != sig:
+        st.session_state["wi_prev_p"] = st.session_state.get("wi_cur_p")
+        st.session_state["wi_sig"] = sig
+    st.session_state["wi_cur_p"] = p
+    prev = st.session_state.get("wi_prev_p")
+
+    with right:
+        st.plotly_chart(fig_gauge(p, cutoff, prev), width="stretch")
+        (st.error if denied else st.success)(
+            f"{'❌ DENIED' if denied else '✅ APPROVED'} — default risk {p:.1%} vs cut-off {cutoff:.1%}"
+            f" · debt-to-income {applicant['debt_to_income']:.2f}")
+        if st.button("📨 Send to underwriter queue", help="Creates a formal application on the Simulator page for human review."):
+            try:
+                st.session_state.current = score_application(ctx, applicant)
+                st.session_state.override_mode = False
+                st.toast("Queued. Open the Applicant Simulator page to accept or override.", icon="📨")
+            except Exception as e:
+                st.error(f"Could not queue the application: {e}")
+
+    t1, t2, t3, t4 = st.tabs(["🧠 Why", "📉 Sensitivity", "🗺️ Risk map", "🧭 Path to approval"])
+    with t1:
+        if not SHAP_OK:
+            st.error("SHAP is not installed (`pip install shap`).")
+        else:
+            try:
+                exp = explain_applicant(ctx["model_file"], encode(pd.DataFrame([applicant]), bundle["columns"]), applicant)
+                st.plotly_chart(fig_shap_waterfall(exp, cutoff), width="stretch")
+            except Exception as e:
+                st.warning(f"Explanation unavailable: {e}")
+    with t2:
+        feat = st.selectbox("Feature to vary", SCENARIO_FEATURES, format_func=lambda f: FEATURE_LABELS[f], index=2, key="wi_sens_feat")
+        st.plotly_chart(fig_sensitivity(sensitivity_curve(bundle, applicant, feat), applicant[feat], p, cutoff,
+                                        FEATURE_LABELS[feat]), width="stretch")
+    with t3:
+        m1, m2 = st.columns(2)
+        fx = m1.selectbox("X axis", SCENARIO_FEATURES, index=1, format_func=lambda f: FEATURE_LABELS[f], key="wi_map_x")
+        fy = m2.selectbox("Y axis", SCENARIO_FEATURES, index=2, format_func=lambda f: FEATURE_LABELS[f], key="wi_map_y")
+        if fx == fy:
+            st.info("Pick two different features.")
+        else:
+            xs, ys, Z = risk_surface(bundle, applicant, fx, fy)
+            st.plotly_chart(fig_risk_surface(xs, ys, Z, cutoff, FEATURE_LABELS[fx], FEATURE_LABELS[fy],
+                                             applicant[fx], applicant[fy]), width="stretch")
+    with t4:
+        cur_p, options = find_recourse(bundle, applicant, cutoff)
+        if cur_p < cutoff:
+            st.success("This applicant is already approved. Nothing to change.")
+        elif options:
+            st.markdown(f"Smallest changes (to inputs an applicant can actually change) that bring risk below **{cutoff:.1%}**:")
+            for o in options:
+                st.success(f"**{o['action']}** — {o['detail']} → default risk {cur_p:.1%} ➜ {o['p_after']:.1%}")
+            st.caption("Model-based guidance, not a promise of approval. Past defaults, credit history and age are deliberately not offered as levers.")
+        else:
+            st.info("No change to the actionable inputs reaches approval. Route to an underwriter for manual review.")
+
+
+# ---- Live Monitor (streaming simulation) -----------------------------------------
+def reset_stream() -> None:
+    """on_click callback: wipe the simulated stream and stop it."""
+    st.session_state.stream = {"idx": [], "times": [], "ticks": 0, "seed": int(datetime.now().timestamp()) % 100000}
+    st.session_state["stream_running"] = False
+
+
+def page_monitor(ctx: dict, pool: pd.DataFrame, scored_all: pd.DataFrame) -> None:
+    st.header("Live Monitor")
+    st.caption("A simulated stream of incoming applications, scored on arrival. Counters, charts and drift alerts refresh automatically.")
+    if pool.empty:
+        st.warning("No loans match the current filters.")
+        return
+    interest, cutoff = ctx["interest"], load_model_bundle(ctx["model_file"])["threshold"]
+
+    c1, c2, c3, c4, c5 = st.columns([1, 1.3, 1.3, 1.6, 0.8])
+    running = c1.toggle("▶ Stream", key="stream_running")
+    speed = c2.slider("Seconds per tick", 0.5, 5.0, 1.5, 0.5)
+    batch = c3.slider("Loans per tick", 1, 10, 3)
+    stress = c4.toggle("🌪️ Simulate economic stress", key="stream_stress",
+                       help="Biases arrivals toward riskier applicants so you can watch the drift alert fire.")
+    c5.button("↺ Reset", on_click=reset_stream, width="stretch")
+
+    baseline = 1 - float(scored_all.loc[pool.index, "reject"].mean())
+    weights = ((pool["p_default"].to_numpy() + 0.02) ** 3) if stress else np.ones(len(pool))
+    weights = weights / weights.sum()
+
+    @st.fragment(run_every=(speed if running else None))
+    def live_panel() -> None:
+        state = st.session_state.stream
+        if running:  # one tick = draw `batch` applications, score (already precomputed), append
+            rng = np.random.default_rng(state["seed"] + state["ticks"])
+            picked = pool.index[rng.choice(len(pool), size=batch, p=weights)]
+            state["idx"].extend(int(i) for i in picked)
+            state["times"].extend([datetime.now().strftime("%H:%M:%S")] * batch)
+            state["idx"], state["times"] = state["idx"][-5000:], state["times"][-5000:]
+            state["ticks"] += 1
+            big = scored_all.loc[picked]
+            big = big[(big["reject"] == 1) & (big["loan_amount"] >= 100000)]
+            if len(big):
+                st.toast(f"Large loan denied: AED {big['loan_amount'].iloc[0]:,.0f} (risk {big['p_default'].iloc[0]:.0%})", icon="🚨")
+        if not state["idx"]:
+            st.info("Flip **▶ Stream** on to start receiving applications.")
+            return
+        frame = scored_all.loc[state["idx"]]
+        m = portfolio_metrics(frame, interest)
+        ser = stream_series(frame, interest)
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("📥 Processed", f"{m['n']:,}", f"{state['ticks']} ticks", delta_color="off")
+        k2.metric("✅ Approval rate", pct(m["approval_rate"]), pts(m["approval_rate"], baseline), delta_color="off",
+                  help="Delta vs the portfolio baseline.")
+        k3.metric("💵 Money saved", aed(m["money"]))
+        k4.metric("🎯 Defaulters caught", f"{m['caught']}/{m['defaulters']}")
+        k5.metric("⚠️ Avg risk score", f"{frame['p_default'].mean():.1%}")
+
+        roll = ser["approval_roll"].iloc[-1]
+        if len(frame) >= 50 and np.isfinite(roll) and abs(roll - baseline) > 0.10:
+            st.warning(f"🚨 **Possible drift:** approval rate over the last 50 applications is {roll:.1%} vs a {baseline:.1%} baseline.")
+        elif len(frame) >= 50:
+            st.success("Approval rate is within the expected ±10-point band.")
+        g1, g2 = st.columns(2)
+        g1.plotly_chart(fig_stream_money(ser), width="stretch")
+        g2.plotly_chart(fig_stream_approval(ser, baseline), width="stretch")
+        g3, g4 = st.columns([3, 2])
+        g3.plotly_chart(fig_risk_hist(frame, cutoff), width="stretch")
+        feed = frame.tail(10).iloc[::-1].assign(Time=state["times"][-10:][::-1])
+        feed["Decision"] = np.where(feed["reject"] == 1, "❌ Denied", "✅ Approved")
+        feed["Outcome (known later)"] = np.where(feed["default"] == 1, "💥 Defaulted", "💚 Repaid")
+        g4.markdown("**Live feed**")
+        g4.dataframe(feed[["Time", "loan_amount", "p_default", "Decision", "Outcome (known later)"]].rename(
+            columns={"loan_amount": "Loan (AED)", "p_default": "Risk"}).style.format({"Loan (AED)": "{:,.0f}", "Risk": "{:.1%}"}),
+            hide_index=True, width="stretch")
+
+    live_panel()
+
+
+# ---- Batch scoring ---------------------------------------------------------------------
+def page_batch(ctx: dict, raw: pd.DataFrame | None) -> None:
+    st.header("Batch Scoring")
+    st.caption("Upload a CSV of applicants and score them all at once with the active model. Files are processed in memory and not stored.")
+    template_cols = BATCH_REQUIRED + ["debt_to_income"]
+    if raw is not None:
+        template = raw.drop(columns="default").head(5)[template_cols]
+    else:
+        template = pd.DataFrame([{**PRESETS["Prime saver"], "debt_to_income": 0.17}])[template_cols]
+    cA, cB = st.columns([1, 1])
+    cA.download_button("⬇️ Download CSV template", template.to_csv(index=False).encode("utf-8"), file_name="applicants_template.csv", mime="text/csv")
+    use_sample = cB.button("🎲 Try with 300 random loans from loans.csv", disabled=raw is None)
+    up = st.file_uploader("Applicant CSV", type=["csv"], help="Required columns: " + ", ".join(BATCH_REQUIRED) + " (debt_to_income is optional).")
+
+    table = None
+    if up is not None:
+        try:
+            table = pd.read_csv(up)
+        except Exception as e:
+            st.error(f"Could not read that file as CSV: {e}")
+            return
+        st.session_state.pop("batch_sample", None)
+    elif use_sample and raw is not None:
+        st.session_state["batch_sample"] = raw.drop(columns="default").sample(300, random_state=int(datetime.now().timestamp()) % 1000)
+    if table is None:
+        table = st.session_state.get("batch_sample")
+    if table is None:
+        st.info("Upload a file (or try the sample) to begin.")
+        return
+
+    clean, errors, warns = validate_batch(table)
+    for e in errors:
+        st.error(e)
+    for w in warns:
+        st.warning(w)
+    if clean is None:
+        return
+
+    bar = st.progress(0.0, text="Scoring applicants…")
+    try:
+        with st.spinner("Running model and SHAP…"):
+            scored = score_batch(ctx["model_file"], clean, progress=lambda f: bar.progress(f, text=f"Scoring… {f:.0%}"))
+    except Exception as e:
+        bar.empty()
+        st.error(f"Scoring failed: {e}")
+        return
+    bar.empty()
+
+    n, denied = len(scored), int((scored["decision"] == "Denied").sum())
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("📄 Applicants scored", f"{n:,}")
+    k2.metric("✅ Approved", f"{n - denied:,}", f"{(n - denied) / n:.1%}", delta_color="off")
+    k3.metric("❌ Denied", f"{denied:,}", f"{denied / n:.1%}", delta_color="off")
+    k4.metric("💼 Approved principal", aed(float(scored.loc[scored["decision"] == "Approved", "loan_amount"].sum())))
+    g1, g2 = st.columns(2)
+    g1.plotly_chart(fig_decision_donut(scored), width="stretch")
+    if "top_driver" in scored.columns and denied:
+        drv = scored.loc[scored["decision"] == "Denied", "top_driver"].value_counts().rename_axis("driver").reset_index(name="n").sort_values("n")
+        fig = go.Figure(go.Bar(y=drv["driver"], x=drv["n"], orientation="h",
+                               marker_color=[PALETTE[i % len(PALETTE)] for i in range(len(drv))]))
+        fig.update_xaxes(title="Denied applicants")
+        g2.plotly_chart(style_fig(fig, height=330, title="Main driver of each denial"), width="stretch")
+    else:
+        g2.plotly_chart(fig_risk_hist(scored.assign(reject=(scored["decision"] == "Denied").astype(int)), load_model_bundle(ctx["model_file"])["threshold"]), width="stretch")
+    show = scored.assign(risk_pct=scored["p_default"] * 100).drop(columns=["p_default"])
+    st.dataframe(show, hide_index=True, width="stretch", column_config={
+        "risk_pct": st.column_config.ProgressColumn("Default risk", min_value=0, max_value=100, format="%.1f%%")})
+    st.download_button("⬇️ Download scored results (CSV)", scored.to_csv(index=False).encode("utf-8"),
+                       file_name="scored_applicants.csv", mime="text/csv", type="primary")
+    st.caption("Decisions here are model outputs only: they are not logged to the human-review audit trail and no adverse-action notices are generated.")
+
+
+# ---- Portfolio explorer -------------------------------------------------------------------
+EXPLORER_AXES = SCENARIO_FEATURES + ["debt_to_income", "p_default"]
+AXIS_LABELS = {**FEATURE_LABELS, "p_default": "Predicted default risk"}
+
+
+def page_explorer(ctx: dict, fdf: pd.DataFrame) -> None:
+    st.header("Portfolio Explorer")
+    st.caption("Slice the portfolio any way you like. Draw a box or lasso on the scatter to analyse just those loans.")
+    if fdf.empty:
+        st.warning("No loans match the current filters.")
+        return
+    sample = fdf.sample(min(len(fdf), 2500), random_state=1)
+
+    x1, x2, x3 = st.columns(3)
+    xa = x1.selectbox("X axis", EXPLORER_AXES, index=EXPLORER_AXES.index("annual_income"), format_func=lambda f: AXIS_LABELS[f])
+    ya = x2.selectbox("Y axis", EXPLORER_AXES, index=EXPLORER_AXES.index("loan_amount"), format_func=lambda f: AXIS_LABELS[f])
+    colour_by = x3.selectbox("Colour by", ["Model decision", "Actual outcome", "Predicted default risk"])
+
+    if colour_by == "Model decision":
+        colours = np.where(sample["reject"] == 1, ROSE, TEAL)
+        legend = "🟥 Denied · 🟩 Approved"
+        marker = dict(size=8, color=list(colours), opacity=0.75, line=dict(color="white", width=0.5))
+    elif colour_by == "Actual outcome":
+        colours = np.where(sample["default"] == 1, ORANGE, SKY)
+        legend = "🟧 Defaulted · 🟦 Repaid"
+        marker = dict(size=8, color=list(colours), opacity=0.75, line=dict(color="white", width=0.5))
+    else:
+        legend = "Colour scale: green = low risk, red = high risk"
+        marker = dict(size=8, color=sample["p_default"], opacity=0.8, colorscale=[[0, "#10B981"], [0.4, "#FDE68A"], [1, "#BE123C"]],
+                      colorbar=dict(title="Risk", tickformat=".0%"), line=dict(color="white", width=0.5))
+    fig = go.Figure(go.Scattergl(
+        x=sample[xa], y=sample[ya], mode="markers", marker=marker,
+        customdata=np.column_stack([sample["p_default"], sample["loan_amount"], sample["reject"], sample["default"]]),
+        hovertemplate=AXIS_LABELS[xa] + " %{x:,.2f}<br>" + AXIS_LABELS[ya] + " %{y:,.2f}<br>Risk %{customdata[0]:.1%}<extra></extra>"))
+    fig.update_xaxes(title=AXIS_LABELS[xa])
+    fig.update_yaxes(title=AXIS_LABELS[ya])
+    style_fig(fig, height=500, title=f"{len(sample):,} loans · {legend}")
+    fig.update_layout(dragmode="select")
+
+    event = st.plotly_chart(fig, key="explorer_scatter", on_select="rerun", selection_mode=["box", "lasso"], width="stretch")
+    try:
+        sel_idx = list(event["selection"]["point_indices"])
+    except Exception:
+        sel_idx = []
+    if sel_idx:
+        sub = sample.iloc[sel_idx]
+        m = portfolio_metrics(sub, ctx["interest"])
+        st.subheader(f"Your selection: {len(sub):,} loans")
+        s1, s2, s3, s4, s5 = st.columns(5)
+        s1.metric("📦 Loans", f"{len(sub):,}")
+        s2.metric("✅ Approval rate", pct(m["approval_rate"]))
+        s3.metric("💥 Actual default rate", f"{sub['default'].mean():.1%}")
+        s4.metric("💵 Money saved", aed(m["money"]))
+        s5.metric("⚠️ Avg risk score", f"{sub['p_default'].mean():.1%}")
+        with st.expander("Rows in selection"):
+            st.dataframe(sub.drop(columns=["is_test"]), hide_index=True, width="stretch")
+    else:
+        st.caption("Tip: drag on the chart to select loans. Their KPIs appear here.")
+
+    left, right = st.columns(2)
+    with left:
+        try:
+            st.plotly_chart(fig_importance(global_importance(ctx["model_file"])), width="stretch")
+        except Exception as e:
+            st.warning(f"Global importance unavailable: {e}")
+    with right:
+        st.markdown("**Segment heat-map**")
+        h1, h2, h3 = st.columns(3)
+        hx = h1.selectbox("Columns", SCENARIO_FEATURES + ["debt_to_income"], index=2, format_func=lambda f: FEATURE_LABELS[f], key="seg_x")
+        hy = h2.selectbox("Rows", SCENARIO_FEATURES + ["debt_to_income"], index=1, format_func=lambda f: FEATURE_LABELS[f], key="seg_y")
+        metric = h3.selectbox("Metric", ["Approval rate", "Actual default rate", "Avg predicted risk"], key="seg_m")
+        if hx == hy:
+            st.info("Pick two different features.")
+        else:
+            st.plotly_chart(fig_segment_heatmap(segment_grid(fdf, hx, hy, metric), FEATURE_LABELS[hx], FEATURE_LABELS[hy], metric), width="stretch")
+    with st.expander("⬇️ Export the filtered portfolio"):
+        st.download_button("Download filtered, scored loans (CSV)", fdf.drop(columns=["is_test"]).to_csv(index=False).encode("utf-8"),
+                           file_name="filtered_portfolio_scored.csv", mime="text/csv")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 11 · MAIN
+# ──────────────────────────────────────────────────────────────────────────────
+def main() -> None:
+    st.set_page_config(page_title="QuickLoan Risk & Compliance Console", page_icon="💰", layout="wide")
+    ensure_state()
+
+    raw, data_err = read_csv_safe("loans.csv", tuple(FEATURES) + ("default",))
+    ctx = sidebar(raw)
+    inject_css(ctx["page"])
+
+    # Load the active model (hard requirement for every page).
+    try:
+        with st.spinner("Loading models…"):
+            load_model_bundle(ctx["model_file"])
+    except FileNotFoundError:
+        st.error(f"Model file `{ctx['model_file']}` was not found next to app.py. Re-run the notebook to regenerate it.")
+        st.stop()
+    except Exception as e:
+        st.error(f"Could not load `{ctx['model_file']}`: {e}. A scikit-learn version mismatch is the usual cause "
+                 "(see requirements.txt).")
+        st.stop()
+
+    st.markdown('<div class="hero"><h1>💰 QuickLoan — Risk & Compliance Console</h1>'
+                '<p>Explainable decisions · Fair-lending audit · Cost-aware portfolio</p></div>', unsafe_allow_html=True)
+
+    # Score the portfolio with the active rule and the other rule (for KPI deltas + fairness comparison).
+    scored = scored_other = None
+    if data_err:
+        st.warning(f"{data_err} Portfolio KPIs, the fairness audit and the cost tab are disabled; the simulator still works.")
+    else:
+        other_file = next(f for f in MODEL_FILES.values() if f != ctx["model_file"])
+        try:
+            with st.spinner("Scoring the portfolio…"):
+                scored, scored_other = scored_portfolio(ctx["model_file"]), scored_portfolio(other_file)
+        except Exception as e:
+            st.warning(f"Portfolio scoring failed: {e}")
+
+    fdf = None
+    if scored is not None:
+        fdf = apply_filters(scored, ctx["filters"])
+        if fdf.empty:
+            st.warning("No loans match the current filters — widen them in the sidebar.")
+        else:
+            base_label = [k for k in MODEL_FILES if MODEL_FILES[k] != ctx["model_file"]][0]
+            fdf_other = scored_other.loc[fdf.index]
+            render_kpis(portfolio_metrics(fdf, ctx["interest"]), portfolio_metrics(fdf_other, ctx["interest"]),
+                        base_label.split(" — ")[1])
+            st.caption(f"KPIs: {len(fdf):,} loans · {ctx['filters'].scope.split(' (')[0]} · deltas vs the other decision rule.")
+    st.divider()
+
+    page = ctx["page"]
+    if page == PAGE_SIM:
+        page_simulator(ctx)
+    elif page == PAGE_WHATIF:
+        page_whatif(ctx)
+    elif page == PAGE_BATCH:
+        page_batch(ctx, raw)
+    elif scored is None or fdf is None:
+        st.info("This page needs `loans.csv` and a working model to score the portfolio.")
+    elif page == PAGE_MONITOR:
+        page_monitor(ctx, fdf, scored)
+    elif page == PAGE_EXPLORE:
+        page_explorer(ctx, fdf)
+    elif page == PAGE_FAIR:
+        page_fairness(ctx, scored, scored_other)
+    else:
+        page_cost(ctx, fdf, scored)
+
+
+if __name__ == "__main__":  # Streamlit executes the script as __main__
+    main()
