@@ -7,3 +7,6 @@ numpy==2.4.4
 pandas==3.0.2
 scipy==1.17.1
 joblib==1.5.3
+# New for the compliance upgrade
+plotly>=6.0
+shap>=0.49
