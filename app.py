@@ -451,4 +451,315 @@ def fig_money_curve(sweep: pd.DataFrame, sel: dict, breakeven: float) -> go.Figu
     """Money saved vs cut-off, with the selected threshold, the cost-matched break-even and the 0.5 rule."""
     fig = go.Figure()
     fig.add_scatter(x=sweep["threshold"], y=sweep["money"], mode="lines", name="Money saved",
-                    line=dict(color=BLUE, width=3), fill="tozeroy", fillcolor
+                    line=dict(color=BLUE, width=3), fill="tozeroy", fillcolor="rgba(59,130,246,0.18)",
+                    hovertemplate="Cut-off %{x:.2f}<br>AED %{y:,.0f}<extra></extra>")
+    fig.add_scatter(x=[sel["threshold"]], y=[sel["money"]], mode="markers", name="Selected cut-off",
+                    marker=dict(size=16, color=ROSE, line=dict(color="white", width=2)))
+    best = sweep.loc[sweep["money"].idxmax()]
+    fig.add_scatter(x=[best["threshold"]], y=[best["money"]], mode="markers", name="Best cut-off on this data",
+                    marker=dict(size=13, symbol="star", color=AMBER, line=dict(color="white", width=1)))
+    fig.add_vline(x=breakeven, line=dict(color=INDIGO, dash="dot"), annotation_text="cost-matched", annotation_position="top left")
+    fig.add_vline(x=0.5, line=dict(color=SKY, dash="dot"), annotation_text="default 0.5 rule", annotation_position="top right")
+    fig.add_hline(y=0, line=dict(color=LIGHT))
+    fig.update_xaxes(title="Reject when P(default) ≥ cut-off", tickformat=".0%")
+    fig.update_yaxes(title="Money saved vs approve-all (AED)", tickformat=",.0f")
+    return style_fig(fig, height=430, title="Reward: money saved as the cut-off moves")
+
+
+def fig_roc(sweep: pd.DataFrame, sel: dict, overlay: pd.DataFrame | None) -> go.Figure:
+    """ROC-style trade-off: defaulters caught (reward) vs good borrowers rejected (cost of friction)."""
+    fig = go.Figure()
+    fig.add_scatter(x=[0, 1], y=[0, 1], mode="lines", name="Random guessing", line=dict(color=LIGHT, dash="dash"), hoverinfo="skip")
+    fig.add_scatter(x=sweep["fpr"], y=sweep["tpr"], mode="lines", name="Gradient Boosting (all cut-offs)",
+                    line=dict(color=PINK, width=3), fill="tozeroy", fillcolor="rgba(236,72,153,0.14)",
+                    customdata=sweep[["threshold", "money"]],
+                    hovertemplate="Cut-off %{customdata[0]:.2f}<br>Good rejected %{x:.1%}<br>Defaulters caught %{y:.1%}"
+                                  "<br>AED %{customdata[1]:,.0f}<extra></extra>")
+    if overlay is not None and len(overlay):
+        fig.add_scatter(x=overlay["fpr"], y=overlay["tpr"], mode="markers", name="Leaderboard models @ 1/6 rule (CSV)",
+                        marker=dict(size=np.clip(overlay["Money_saved"] / overlay["Money_saved"].max() * 26, 8, 26),
+                                    color=ORANGE, opacity=0.7, line=dict(color="white", width=1)),
+                        text=overlay["Model"], customdata=overlay["Money_saved"],
+                        hovertemplate="%{text}<br>Good rejected %{x:.1%}<br>Defaulters caught %{y:.1%}"
+                                      "<br>AED %{customdata:,.0f}<extra></extra>")
+    fig.add_scatter(x=[sel["fpr"]], y=[sel["tpr"]], mode="markers", name="Selected cut-off",
+                    marker=dict(size=17, color=ROSE, line=dict(color="white", width=2)))
+    fig.update_xaxes(title="Good borrowers rejected (false-positive rate)", tickformat=".0%", range=[0, 1])
+    fig.update_yaxes(title="Defaulters caught (recall)", tickformat=".0%", range=[0, 1.02])
+    return style_fig(fig, height=430, title="Risk vs reward: ROC view")
+
+
+def fig_risk_reward(sweep: pd.DataFrame, sel: dict) -> go.Figure:
+    """Residual risk (default rate among approved loans) vs reward (money saved)."""
+    fig = go.Figure()
+    fig.add_scatter(x=sweep["default_rate_approved"], y=sweep["money"], mode="lines+markers", name="Cut-off path",
+                    line=dict(color=TEAL, width=3), marker=dict(size=6, color=ORANGE), customdata=sweep[["threshold"]],
+                    hovertemplate="Cut-off %{customdata[0]:.2f}<br>Default rate of approved %{x:.2%}<br>AED %{y:,.0f}<extra></extra>")
+    fig.add_scatter(x=[sel["default_rate_approved"]], y=[sel["money"]], mode="markers", name="Selected cut-off",
+                    marker=dict(size=17, color=ROSE, line=dict(color="white", width=2)))
+    fig.update_xaxes(title="Default rate among approved loans (residual risk)", tickformat=".1%")
+    fig.update_yaxes(title="Money saved vs approve-all (AED)", tickformat=",.0f")
+    return style_fig(fig, height=430, title="Risk vs reward: savings vs residual default risk")
+
+
+def fig_cv_robustness(cv: pd.DataFrame) -> go.Figure:
+    """Cross-validated money saved per model under both decision rules (error bars = fold std at 0.5)."""
+    cv = cv.sort_values("CV money @1/6 (mean)")
+    fig = go.Figure()
+    fig.add_bar(y=cv["Model"], x=cv["CV money @0.5 (mean)"], orientation="h", name="0.5 rule", marker_color=SKY,
+                error_x=dict(type="data", array=cv["CV money @0.5 (std)"], color=INDIGO))
+    fig.add_bar(y=cv["Model"], x=cv["CV money @1/6 (mean)"], orientation="h", name="Cost-matched 1/6 rule", marker_color=PINK)
+    fig.update_layout(barmode="group")
+    fig.update_xaxes(title="Cross-validated money saved (AED)", tickformat=",.0f")
+    return style_fig(fig, height=520, title="Robustness: 15-fold cross-validation")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7 · UI HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+def inject_css(page: str = PAGE_SIM) -> None:
+    """Colourful layer on top of config.toml: pastel page background, per-page gradient hero, vivid KPI cards,
+    multicolour sidebar/tabs/buttons. Each page gets its own accent gradient (PAGE_THEMES)."""
+    c1, c2, c3 = PAGE_THEMES[PAGE_KEYS.get(page, "sim")]
+    st.markdown(
+        f"""<style>
+        .stApp {{background:linear-gradient(160deg,#FDF2F8 0%,#EEF2FF 30%,#ECFEFF 62%,#FFFBEB 100%);}}
+        [data-testid="stHeader"] {{background:transparent;}}
+        .block-container {{padding-top:1.5rem;}}
+        h1, h2, h3 {{letter-spacing:-0.01em;}}
+        h2 {{color:{c1};border-bottom:4px solid {c2};padding-bottom:.2rem;display:inline-block;}}
+        h3 {{color:{c2};}}
+        .hero {{background:linear-gradient(120deg,{c1} 0%,{c2} 55%,{c3} 100%);color:white;padding:1.6rem 2rem;
+               border-radius:20px;margin-bottom:1rem;box-shadow:0 10px 28px rgba(0,0,0,.18);}}
+        .hero h1 {{color:white;margin:0;font-size:2.1rem;}}
+        .hero p {{color:rgba(255,255,255,.92);margin:.3rem 0 0 0;font-size:1.02rem;}}
+        
+        /* Metric Label Text Truncation Fixes */
+        [data-testid="stMetricLabel"] {{ white-space: normal !important; word-wrap: break-word !important; overflow: visible !important; }}
+        [data-testid="stMetricLabel"] * {{ white-space: normal !important; overflow: visible !important; }}
+        
+        /* KPI cards: solid vivid gradients, one per column, white text, delta in a white pill */
+        [data-testid="stMetric"] {{border-radius:18px;padding:14px 18px;box-shadow:0 6px 16px rgba(0,0,0,.15);
+               background:linear-gradient(135deg,#10B981,#14B8A6);}}
+        [data-testid="stHorizontalBlock"] > div:nth-child(2) [data-testid="stMetric"] {{background:linear-gradient(135deg,#6366F1,#8B5CF6);}}
+        [data-testid="stHorizontalBlock"] > div:nth-child(3) [data-testid="stMetric"] {{background:linear-gradient(135deg,#F97316,#F59E0B);}}
+        [data-testid="stHorizontalBlock"] > div:nth-child(4) [data-testid="stMetric"] {{background:linear-gradient(135deg,#0EA5E9,#3B82F6);}}
+        [data-testid="stHorizontalBlock"] > div:nth-child(5) [data-testid="stMetric"] {{background:linear-gradient(135deg,#EC4899,#F43F5E);}}
+        [data-testid="stMetricLabel"], [data-testid="stMetricLabel"] *, [data-testid="stMetricValue"], [data-testid="stMetricValue"] * {{color:white !important;}}
+        [data-testid="stMetricDelta"] {{background:rgba(255,255,255,.94);border-radius:999px;padding:1px 10px;width:fit-content;}}
+        /* sidebar */
+        [data-testid="stSidebar"] > div:first-child {{background:linear-gradient(180deg,#1E1B4B 0%,#4C1D95 55%,#9D174D 100%);}}
+        /* buttons */
+        .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {{
+               background:linear-gradient(90deg,{c1},{c3});border:none;color:white;font-weight:700;box-shadow:0 6px 14px rgba(0,0,0,.2);}}
+        .stButton > button:not([kind="primary"]) {{border:2px solid {c1};color:{c1};background:white;font-weight:600;}}
+        /* tabs: every tab its own colour */
+        .stTabs [data-baseweb="tab-list"] {{gap:8px;}}
+        .stTabs [data-baseweb="tab"] {{border-radius:12px 12px 0 0;padding:8px 20px;}}
+        .stTabs [data-baseweb="tab"]:nth-child(1) {{background:#EDE9FE;}}
+        .stTabs [data-baseweb="tab"]:nth-child(2) {{background:#FFEDD5;}}
+        .stTabs [data-baseweb="tab"]:nth-child(3) {{background:#CFFAFE;}}
+        .stTabs [data-baseweb="tab"]:nth-child(4) {{background:#FCE7F3;}}
+        .stTabs [data-baseweb="tab"]:nth-child(1)[aria-selected="true"] {{background:linear-gradient(90deg,#7C3AED,#C026D3);}}
+        .stTabs [data-baseweb="tab"]:nth-child(2)[aria-selected="true"] {{background:linear-gradient(90deg,#EA580C,#F59E0B);}}
+        .stTabs [data-baseweb="tab"]:nth-child(3)[aria-selected="true"] {{background:linear-gradient(90deg,#0891B2,#10B981);}}
+        .stTabs [data-baseweb="tab"]:nth-child(4)[aria-selected="true"] {{background:linear-gradient(90deg,#DB2777,#F43F5E);}}
+        .stTabs [aria-selected="true"] p {{color:white;font-weight:700;}}
+        /* expanders and form */
+        [data-testid="stExpander"] {{background:rgba(255,255,255,.85);border:1px solid #E9D5FF;border-left:6px solid {c2};border-radius:14px;}}
+        [data-testid="stForm"] {{background:linear-gradient(135deg,#F5F3FF 0%,#FDF2F8 50%,#FFF7ED 100%);border:2px solid {c2};border-radius:18px;}}
+        </style>""", unsafe_allow_html=True)
+
+
+def ensure_state() -> None:
+    """Initialise session_state keys used for the audit trail and the current decision."""
+    st.session_state.setdefault("audit_log", [])  # list[dict] — simulated audit trail
+    st.session_state.setdefault("current", None)  # the application currently on screen
+    st.session_state.setdefault("override_mode", False)
+    st.session_state.setdefault("stream", {"idx": [], "times": [], "ticks": 0, "seed": 42})  # live-monitor state
+
+
+def aed(v: float) -> str:
+    return f"AED {v:,.0f}"
+
+
+def signed_aed(v: float) -> str:
+    # ASCII '-' on purpose: st.metric only colours a delta as negative when it starts with '-'
+    return f"{'+' if v >= 0 else '-'}AED {abs(v):,.0f}"
+
+
+def pct(v: float, digits: int = 1) -> str:
+    """Percent string that survives NaN (e.g. when filters leave no defaulters or no approvals)."""
+    return "n/a" if not np.isfinite(v) else f"{v * 100:.{digits}f}%"
+
+
+def pts(a: float, b: float, digits: int = 1) -> str | None:
+    """Signed percentage-point difference, or None (no delta shown) if either side is NaN."""
+    return None if not (np.isfinite(a) and np.isfinite(b)) else f"{(a - b) * 100:+.{digits}f} pts"
+
+
+def render_kpis(m: dict, base: dict, base_label: str) -> None:
+    """Top-level KPI row. Deltas compare the active decision rule with the other rule on the same loans."""
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("💵 Money saved vs approve-all", aed(m["money"]), signed_aed(m["money"] - base["money"]),
+              help=f"Delta vs {base_label}")
+    c2.metric("🎯 Defaulters caught", f"{m['caught']}/{m['defaulters']}", pts(m["recall"], base["recall"]) ,
+              help=f"Recall delta vs {base_label}")
+    c3.metric("😕 Good borrowers rejected", f"{m['wrong']:,}", f"{m['wrong'] - base['wrong']:+,}",
+              delta_color="inverse", help=f"Delta vs {base_label}. Fewer is better for customer experience.")
+    c4.metric("✅ Approval rate", pct(m["approval_rate"]), pts(m["approval_rate"], base["approval_rate"]),
+              delta_color="off", help=f"Delta vs {base_label}")
+    c5.metric("⚠️ Default rate of approved", pct(m["default_rate_approved"], 2),
+              pts(m["default_rate_approved"], base["default_rate_approved"], 2), delta_color="inverse",
+              help=f"Residual portfolio risk. Delta vs {base_label}.")
+
+
+def sidebar(df: pd.DataFrame | None) -> dict:
+    """Navigation + global controls. Returns everything the pages need."""
+    with st.sidebar:
+        st.markdown("## 💰 QuickLoan")
+        st.caption("Risk & Compliance Console")
+        page = st.radio("Navigate", NAV_PAGES, label_visibility="collapsed")
+        st.divider()
+
+        st.markdown("#### ⚙️ Decision model")
+        model_label = st.radio("Which model decides?", list(MODEL_FILES), index=0, label_visibility="collapsed")
+        st.caption("**Cost-matched 1/6 rule:** reject when P(default) ≥ i/(1+i). Losing a loan costs 5× the interest lost "
+                   "by turning away a good customer.\n\n**Default 0.5 rule:** reject only at P(default) ≥ 50 %.")
+        interest = st.number_input("Interest margin assumption", 0.05, 0.60, 0.20, 0.01, format="%.2f",
+                                   help="Used in money-saved maths and the break-even cut-off i/(1+i).")
+        underwriter = st.text_input("Underwriter ID", value="underwriter_01", help="Written to the audit trail.")
+        st.divider()
+
+        st.markdown("#### 🔎 Global filters")
+        scope = st.radio("Evaluation data", [SCOPE_TEST, SCOPE_FULL], index=0)
+        if df is not None:
+            age = st.slider("Age", int(df["age"].min()), int(df["age"].max()), (int(df["age"].min()), int(df["age"].max())))
+            lo, hi = int(df["loan_amount"].min()), int(df["loan_amount"].max())
+            loan = st.slider("Loan amount (AED)", lo, hi, (lo, hi), step=1000)
+            homes = st.multiselect("Home ownership", sorted(df["home_ownership"].unique()),
+                                   default=sorted(df["home_ownership"].unique()))
+        else:
+            age, loan, homes = (21, 64), (0, 10 ** 9), ["rent", "own", "mortgage"]
+            st.caption("Filters appear once loans.csv is available.")
+    return {"page": page, "model_label": model_label, "model_file": MODEL_FILES[model_label], "interest": interest,
+            "underwriter": underwriter.strip(), "filters": Filters(age, loan, tuple(homes), scope)}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8 · PAGE 1 — SIMULATOR + XAI + HUMAN-IN-THE-LOOP
+# ──────────────────────────────────────────────────────────────────────────────
+def applicant_form() -> dict | None:
+    """Input form. Nothing is scored until the user presses the submit button."""
+    with st.form("applicant_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            age = st.slider("Age", 21, 64, 35)
+            annual_income = st.number_input("Annual income (AED)", 24000, 400000, 90000, step=1000)
+            loan_amount = st.number_input("Loan amount (AED)", 5000, 150000, 40000, step=1000)
+            loan_term_months = st.selectbox("Loan term (months)", [12, 24, 36, 48, 60], index=2)
+            employment_years = st.slider("Employment years", 0.0, 35.0, 4.0, 0.5)
+        with c2:
+            credit_history_months = st.slider("Credit history (months)", 0, 300, 60)
+            num_existing_loans = st.slider("Existing loans", 0, 8, 1)
+            past_defaults = st.slider("Past defaults", 0, 6, 0)
+            home_ownership = st.selectbox("Home ownership", ["rent", "own", "mortgage"])
+            st.caption("Debt-to-income is computed automatically as loan amount ÷ annual income.")
+        submitted = st.form_submit_button("Score application", type="primary")
+    if not submitted:
+        return None
+    return dict(age=age, annual_income=annual_income, loan_amount=loan_amount, loan_term_months=loan_term_months,
+                employment_years=employment_years, credit_history_months=credit_history_months,
+                num_existing_loans=num_existing_loans, past_defaults=past_defaults,
+                debt_to_income=round(loan_amount / (annual_income + 1), 2), home_ownership=home_ownership)
+
+
+def score_application(ctx: dict, applicant: dict) -> dict:
+    """Run model + SHAP inside an st.status block so the user sees progress."""
+    bundle = load_model_bundle(ctx["model_file"])
+    with st.status("Scoring application…", expanded=True) as status:
+        st.write("Encoding applicant features…")
+        X = encode(pd.DataFrame([applicant]), bundle["columns"])
+        st.write("Running the credit model…")
+        pred = int(np.asarray(bundle["model"].predict(X))[0])
+        prob = float(bundle["base"].predict_proba(X)[0, 1])
+        exp = None
+        if SHAP_OK:
+            st.write("Computing SHAP feature contributions…")
+            try:
+                exp = explain_applicant(ctx["model_file"], X, applicant)
+            except Exception as e:  # keep the decision even if the explanation fails
+                st.warning(f"Explanation could not be generated: {e}")
+        status.update(label="Decision ready", state="complete", expanded=False)
+    reasons = principal_reasons(exp["table"]) if (exp and pred == 1) else []
+    return {"id": f"APP-{uuid.uuid4().hex[:8].upper()}", "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "applicant": applicant, "model": ctx["model_label"], "model_file": ctx["model_file"], "prob": prob,
+            "cutoff": bundle["threshold"], "model_decision": "Denied" if pred == 1 else "Approved",
+            "exp": exp, "reasons": reasons, "status": "pending", "final_decision": None, "justification": ""}
+
+
+def commit_decision(cur: dict, underwriter: str, action: str, final: str, justification: str = "") -> None:
+    """Write one immutable-style row to the simulated audit trail and lock the decision."""
+    cur.update(status="accepted" if action == "Accepted model decision" else "overridden",
+               final_decision=final, justification=justification.strip())
+    st.session_state.audit_log.append({
+        "logged_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "application_id": cur["id"], "underwriter": underwriter, "model": cur["model"],
+        "p_default": round(cur["prob"], 4), "cutoff": round(cur["cutoff"], 4),
+        "model_decision": cur["model_decision"], "human_action": action, "final_decision": final,
+        "justification": justification.strip(),
+        "top_reasons": "; ".join(r["reason"] for r in cur["reasons"]),
+        "inputs": json.dumps(cur["applicant"]),
+    })
+    st.session_state.override_mode = False
+
+
+def render_decision(cur: dict) -> None:
+    """Prediction banner + probability metrics."""
+    p, cut = cur["prob"], cur["cutoff"]
+    if cur["model_decision"] == "Denied":
+        st.error(f"❌ **Model decision: DENIED** — predicted default risk {p:.1%} is at or above the {cut:.1%} cut-off.")
+    else:
+        st.success(f"✅ **Model decision: APPROVED** — predicted default risk {p:.1%} is below the {cut:.1%} cut-off.")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Default probability", f"{p:.1%}")
+    c2.metric("Decision cut-off", f"{cut:.1%}")
+    c3.metric("Margin to cut-off", f"{(p - cut) * 100:+.1f} pts", delta_color="inverse",
+              help="Positive = above the cut-off (reject side).")
+
+
+def render_xai(cur: dict) -> None:
+    """SHAP waterfall + explanation tables."""
+    st.subheader("Why this decision?")
+    exp = cur["exp"]
+    if not SHAP_OK:
+        st.error("SHAP is not installed, so the explanation is unavailable. Run `pip install shap` and restart the app."
+                 + (f"\n\nImport error: `{SHAP_ERR}`" if SHAP_ERR else ""))
+        return
+    if exp is None:
+        return
+    st.plotly_chart(fig_shap_waterfall(exp, cur["cutoff"]), width="stretch")
+    st.caption(f"Baseline default probability for an average applicant is {sigmoid(exp['base']):.1%}; this applicant scores "
+               f"{sigmoid(exp['final']):.1%}. Red bars raise default risk (toward denial), green bars lower it.")
+    if not exp["additive_ok"]:
+        st.caption("⚠️ SHAP contributions differ slightly from the model's raw score; treat magnitudes as approximate.")
+    a = cur["applicant"]
+    age_row = exp["table"].loc[exp["table"]["feature"] == "age", "shap"].iloc[0]
+    if cur["model_decision"] == "Denied" and a["age"] >= 62 and age_row > 0.02:
+        st.warning("⚠️ **ECOA age check:** this applicant is 62 or older and age pushed the score toward denial. Reg B only "
+                   "permits age in an empirically derived, statistically sound system that does not assign a negative "
+                   "value to applicants aged 62+. Escalate to compliance before issuing this decision.")
+    with st.expander("Full contribution table"):
+        show = exp["table"].rename(columns={"label": "Feature", "value": "Applicant value", "shap": "Effect (log-odds)"})
+        st.dataframe(show[["Feature", "Applicant value", "Effect (log-odds)"]]
+                     .style.format({"Effect (log-odds)": "{:+.3f}"}), hide_index=True, width="stretch")
+
+
+def render_hitl(cur: dict, ctx: dict) -> None:
+    """Human-in-the-loop controls + adverse action notice + audit trail."""
+    st.subheader("Human-in-the-loop review")
+    opposite = "Approved" if cur["model_decision"] == "Denied" else "Denied"
+
+    if cur["status"] == "pending":
+        st.caption(f"Application **{cur['id']}** is awaiting underwriter review.")
+        c1, c2, _ = st.columns([1, 1, 2])
