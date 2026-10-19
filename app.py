@@ -1,18 +1,32 @@
-# app.py — QuickLoan Risk Dashboard  (Stretch goal)
+# app.py — QuickLoan Risk Dashboard
 # Run locally:  streamlit run app.py
-# Needs (same folder):  loan_model.joblib  and  loans.csv
-# Save your best model in your notebook like this:
+# Needs (same folder): loan_model.joblib, loan_model_costaware.joblib, loans.csv, leaderboard.csv, leaderboard_chart.png
+# Model files are saved by the notebook like this:
 #   joblib.dump({'model': clf, 'columns': list(X_train.columns)}, 'loan_model.joblib')
+from pathlib import Path
 import streamlit as st, pandas as pd, numpy as np, joblib
 from sklearn.model_selection import train_test_split
 
-st.set_page_config(page_title="QuickLoan Risk Dashboard", page_icon="💰")
+HERE = Path(__file__).parent          # so the app works no matter which folder it is launched from
+st.set_page_config(page_title="QuickLoan Risk Dashboard", page_icon="💰", layout="wide")
+
+MODEL_FILES = {
+    "Gradient Boosting — recommended (cost-matched 1/6 rule)": "loan_model_costaware.joblib",
+    "Gradient Boosting — bake-off champion (default 0.5 rule)": "loan_model.joblib",
+}
 
 @st.cache_resource
-def load():
-    M = joblib.load("loan_model.joblib")
+def load(fname):
+    M = joblib.load(HERE / fname)
     return M["model"], M["columns"]
-model, COLUMNS = load()
+
+st.sidebar.header("⚙️ Model")
+choice = st.sidebar.radio("Which model should decide?", list(MODEL_FILES), index=0)
+st.sidebar.caption(
+    "**Cost-matched 1/6 rule:** reject when P(default) ≥ 1/6, because losing a loan costs 5× the "
+    "interest lost by turning away a good customer (0.20 / 1.20 = 1/6).\n\n"
+    "**Default 0.5 rule:** reject only when P(default) ≥ 50 % — the setting scored on the leaderboard.")
+model, COLUMNS = load(MODEL_FILES[choice])
 
 def encode(df):
     return pd.get_dummies(df, columns=["home_ownership"]).reindex(columns=COLUMNS, fill_value=0)
@@ -24,6 +38,7 @@ def money_saved(y_true, y_pred, loan, interest=0.20):
     return loan[caught].sum() - interest*loan[wrong].sum()
 
 st.title("💰 QuickLoan — Risk Dashboard")
+st.caption(f"Active model: **{choice}**")
 
 # ---------- CARD 1: Decision ----------
 st.header("1 · Loan Decision")
@@ -57,7 +72,7 @@ else:
 # ---------- CARD 2: Money saved on the portfolio ----------
 st.header("2 · Money Saved (portfolio view)")
 try:
-    df = pd.read_csv("loans.csv")
+    df = pd.read_csv(HERE / "loans.csv")
     X = encode(df.drop(columns="default")); y = df["default"]
     Xtr,Xte,ytr,yte,lo_tr,lo_te = train_test_split(X,y,df["loan_amount"],test_size=0.25,random_state=1,stratify=y)
     pred_te = model.predict(Xte)
@@ -68,6 +83,22 @@ try:
     m1.metric("💵 Money saved vs approve-all", f"AED {saved:,.0f}")
     m2.metric("🎯 Defaulters caught", f"{caught}/{total_def}")
     m3.metric("😕 Good borrowers rejected", f"{wrong}")
-    st.caption("Evaluated on a held-out test split of loans.csv using the model you trained.")
+    st.caption("Evaluated on a held-out test split of loans.csv (25 %, 1,500 loans) using the model you trained.")
 except FileNotFoundError:
     st.info("Put loans.csv in this folder to see the money-saved view.")
+
+# ---------- CARD 3: Leaderboard ----------
+st.header("3 · The Bake-Off Leaderboard")
+try:
+    lb = pd.read_csv(HERE / "leaderboard.csv")
+    show = lb[["Model","Family","Accuracy","Recall","Money_saved","Defaulters_caught","Good_rejected"]].rename(
+        columns={"Money_saved": "Money saved (AED)", "Defaulters_caught": "Defaulters caught", "Good_rejected": "Good rejected"})
+    st.dataframe(show.style.format({"Accuracy": "{:.2%}", "Recall": "{:.2%}", "Money saved (AED)": "{:,.0f}"}),
+                 hide_index=True, width="stretch")
+    st.caption("All 10 models scored on the same test set with the default 0.5 rule. "
+               "Accuracy spans 1.5 points; money saved varies 2.4×.")
+    img = HERE / "leaderboard_chart.png"
+    if img.exists():
+        st.image(str(img), width="stretch")
+except FileNotFoundError:
+    st.info("Put leaderboard.csv in this folder to see the leaderboard.")

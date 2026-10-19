@@ -1,0 +1,9 @@
+# Runtime dependencies for the dashboard (Streamlit Community Cloud reads this file).
+# scikit-learn / numpy / pandas are pinned to the versions the .joblib model files were saved with:
+# a pickled scikit-learn model can fail to load on a different scikit-learn version.
+streamlit==1.66.0
+scikit-learn==1.8.0
+numpy==2.4.4
+pandas==3.0.2
+scipy==1.17.1
+joblib==1.5.3

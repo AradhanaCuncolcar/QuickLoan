@@ -1,0 +1,8 @@
+# Only needed to re-run the notebook locally (not needed to run the dashboard):
+#   pip install -r requirements-notebook.txt
+-r requirements.txt
+xgboost
+matplotlib
+seaborn
+jupyter
+nbformat
